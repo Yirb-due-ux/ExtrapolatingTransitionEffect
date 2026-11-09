@@ -1,6 +1,7 @@
 #pragma once
 
 #include <SKSE/Impl/PCH.h>
+#include <RE/H/hkBitField.h>
 #include <RE/H/hkbGeneratorOutput.h>
 
 #include "Extrapolate.h"
@@ -46,11 +47,11 @@ namespace XTE
     inline Track FindQsTrack(std::span<std::byte> packet, RE::hkbGeneratorOutput::TrackId id) noexcept
     {
         using Output = RE::hkbGeneratorOutput;
-        constexpr std::int32_t masterBytes = sizeof(Output::MasterHeader);
+        constexpr std::int32_t masterBytes = sizeof(Output::TrackMasterHeader);
         constexpr std::int32_t headerBytes = sizeof(Output::TrackHeader);
         if (packet.size() < masterBytes) return {};
 
-        Output::MasterHeader master;
+        Output::TrackMasterHeader master;
         std::memcpy(&master, packet.data(), sizeof(master));
         const auto index = static_cast<std::int32_t>(id);
         if (master.numBytes < masterBytes || master.numBytes > kMaxTrackBytes ||
@@ -61,9 +62,10 @@ namespace XTE
         if (master.numBytes < directoryBytes) return {};
         Output::TrackHeader header;
         std::memcpy(&header, packet.data() + masterBytes + index * headerBytes, sizeof(header));
-        constexpr auto incompatibleFlags = Output::kAdditivePose | Output::kPalette | Output::kSparse;
-        if (header.type != Output::TrackType::kQsTransform || (header.flags & incompatibleFlags) ||
-            header.elementSize != sizeof(Transform) || header.numData <= 0 ||
+        using Flag = Output::TrackFlagBits;
+        if (header.type != Output::TrackType::kQsTransform ||
+            header.flags.any(Flag::kAdditivePose, Flag::kPalette, Flag::kSparse) ||
+            header.elementSizeBytes != sizeof(Transform) || header.numData <= 0 ||
             header.numData > static_cast<std::int16_t>(kMaxBones) || header.numData > header.capacity ||
             header.dataOffset < directoryBytes || header.dataOffset % alignof(Transform)) return {};
 
@@ -82,9 +84,9 @@ namespace XTE
     {
         // For a live output the engine owns the packet and supplies its extent.
         const auto bytes = output.GetNumBytes();
-        if (bytes < static_cast<std::int32_t>(sizeof(RE::hkbGeneratorOutput::MasterHeader)) ||
+        if (bytes < static_cast<std::int32_t>(sizeof(RE::hkbGeneratorOutput::TrackMasterHeader)) ||
             bytes > kMaxTrackBytes) return {};
-        return FindQsTrack(std::span{output.tracks, static_cast<std::size_t>(bytes)}, id);
+        return FindQsTrack(std::span{reinterpret_cast<std::byte*>(output.tracks), static_cast<std::size_t>(bytes)}, id);
     }
 
     inline Transform TrackValue(const Track& track) noexcept

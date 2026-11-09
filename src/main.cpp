@@ -33,7 +33,8 @@ namespace
     using Output = RE::hkbGeneratorOutput;
     using TrackId = Output::TrackId;
     using SyncInfo = RE::hkbGeneratorSyncInfo;
-    using Children = RE::hkbNode::Children;
+    using Children = RE::hkbNode::ChildrenInfo;
+    using ChildrenFlags = RE::hkbNode::GetChildrenFlags;
     using Transform = XTE::Transform;
     using XTE::QsTrack;
     using XTE::TrackValue;
@@ -42,7 +43,7 @@ namespace
     using Update = void (*)(Node*, const Context&, float);
     using Clone = RE::hkbNode* (*)(const RE::hkbNode*, Graph&);
     using Destroy = Node* (*)(Node*, std::uint32_t);
-    using GetChildren = void (*)(Node*, std::uint32_t, Children&);
+    using GetChildren = void (*)(Node*, ChildrenFlags, Children&);
 
     // Verified slots used by the registered transition class.
     enum class Slot : std::size_t
@@ -140,7 +141,7 @@ namespace
     {
         auto* info = ActiveNode(&graph, node);
         if (!info) return nullptr;
-        if (info->hasSharedSyncInfo) {
+        if (info->useSyncInfoIndex) {
             const auto index = info->syncInfoIndex;
             if (index < 0 || index >= graph.activeNodes->size()) return nullptr;
             info = &(*graph.activeNodes)[index];
@@ -222,25 +223,26 @@ namespace
         }
     }
 
-    void EnumerateChildren(Effect* effect, std::uint32_t flags, Children& children) noexcept
+    void EnumerateChildren(Effect* effect, ChildrenFlags flags, Children& children) noexcept
     {
         Chained<GetChildren>(Slot::getChildren)(effect, flags, children);
         auto& state = Extension(effect);
-        constexpr auto activeOnly = static_cast<std::uint32_t>(RE::hkbNode::GetChildrenFlagBits::kActiveOnly);
-        if (!state.enabled || !(flags & activeOnly) || !children.list || children.list->size() != 2) return;
+        constexpr auto activeOnly = RE::hkbNode::GetChildrenFlagBits::kActiveOnly;
+        auto& list = children.childInfos;
+        if (!state.enabled || !flags.any(activeOnly) || list.size() != 2) return;
         // Generators-only queries can run before Update requests the active graph rebuild.
         if (flags == activeOnly && state.fromActive && (state.ready || effect->timeRemaining < 0)) {
             if (state.ready && effect->timeRemaining > 0) {
-                state.prefix = effect->timeElapsed;
+                state.prefix = effect->timeInTransition;
                 state.blendDuration = effect->duration - state.prefix;
-                effect->timeElapsed = 0.0f;
+                effect->timeInTransition = 0.0f;
                 effect->timeRemaining = state.blendDuration;
             }
             state.fromActive = false;
         }
-        if (state.fromActive) (*children.list)[0] = (*children.list)[1];
-        (*children.list)[0].reset = children.reset;
-        children.list->_size = 1;
+        if (state.fromActive) list[0] = list[1];
+        list[0].reset = children.reset;
+        list._size = 1;
     }
 
     bool CanRecycle(Effect* effect) noexcept
@@ -253,7 +255,7 @@ namespace
     {
         const auto& state = Extension(effect);
         if (!state.enabled) return Chained<bool (*)(Node*)>(Slot::isDone)(effect);
-        return effect->timeElapsed > 0 && (effect->fromGenerator == effect->toGenerator || (!state.fromActive && effect->timeRemaining <= 0));
+        return effect->timeInTransition > 0 && (effect->fromGenerator == effect->toGenerator || (!state.fromActive && effect->timeRemaining <= 0));
     }
 
     bool IsSyncable(Effect* effect, Graph& graph) noexcept
@@ -261,24 +263,24 @@ namespace
         const auto& state = Extension(effect);
         if (!state.enabled) return Chained<bool (*)(Node*, Graph&)>(Slot::isSyncable)(effect, graph);
         const auto* from = state.fromActive ? ActiveSync(graph, effect->fromGenerator) : &state.fromSync;
-        if (!from || from->frequency == 0) return false;
+        if (!from || from->duration == 0) return false;
         if (state.fromActive) return true;
         const auto* to = ActiveSync(graph, effect->toGenerator);
-        return to && to->frequency != 0;
+        return to && to->duration != 0;
     }
 
     bool ToStarted(Effect* effect) noexcept
     {
         const auto& state = Extension(effect);
         if (!state.enabled) return Chained<bool (*)(Node*)>(Slot::toStarted)(effect);
-        return !state.fromActive && (effect->timeElapsed == 0 || !state.ready);
+        return !state.fromActive && (effect->timeInTransition == 0 || !state.ready);
     }
 
     bool UseFromOnly(Effect* effect) noexcept
     {
         const auto& state = Extension(effect);
         if (!state.enabled) return Chained<bool (*)(Node*)>(Slot::useFromOnly)(effect);
-        return state.fromActive || effect->timeElapsed == 0 || !state.ready;
+        return state.fromActive || effect->timeInTransition == 0 || !state.ready;
     }
 
     const SyncInfo* FromSyncInfo(Effect* effect, Graph& graph) noexcept
@@ -302,7 +304,7 @@ namespace
     {
         const auto& state = Extension(effect);
         if (!state.enabled) return Chained<bool (*)(Node*)>(Slot::isFirstFrame)(effect);
-        return state.fromActive && effect->timeElapsed == 0;
+        return state.fromActive && effect->timeInTransition == 0;
     }
 
     void CaptureSource(State& state, const Output& input, float elapsed, float timeOffset) noexcept
@@ -352,13 +354,13 @@ namespace
         const auto sourcePose = QsTrack(to, TrackId::kPose);
         const auto destination = QsTrack(output, TrackId::kPose);
         if (!state.ready || destination.count != state.boneCount || sourcePose.count != state.boneCount) return;
-        const float duration = effect->timeElapsed + effect->timeRemaining;
-        float weight = duration != 0 ? (std::min)(effect->timeElapsed + timeOffset, duration) / duration : 0;
+        const float duration = effect->timeInTransition + effect->timeRemaining;
+        float weight = duration != 0 ? (std::min)(effect->timeInTransition + timeOffset, duration) / duration : 0;
         const Transform* predicted = state.pose.data();
         std::bitset<kMaxBones> replaceRotation;
         auto* stable = state.stable.get();
         if (stable) {
-            const float clock = state.prefix + effect->timeElapsed + timeOffset - stable->sourceSampleTime;
+            const float clock = state.prefix + effect->timeInTransition + timeOffset - stable->sourceSampleTime;
             if (!std::isfinite(clock) || !std::isfinite(weight)) return;
             const float age = (std::max)(0.0f, clock);
             weight = std::clamp(weight, 0.0f, 1.0f);
@@ -366,7 +368,7 @@ namespace
             const auto* graph = context.character ? context.character->behaviorGraph.get() : nullptr;
             const auto* toSync = commit && stable->goalAge < 0 && weight > 0 && sourcePose.fraction > 0 && graph ?
                 ActiveSync(*graph, effect->toGenerator) : nullptr;
-            const bool latchGoal = toSync && toSync->frequency > 0;
+            const bool latchGoal = toSync && toSync->duration > 0;
             if (latchGoal) stable->goalAge = age;
             for (std::size_t i = 0; i < state.boneCount; ++i) {
                 const bool validTarget = sourcePose.Has(i);
@@ -407,13 +409,13 @@ namespace
             state.world = XTE::Compose(value, state.motion);
         }
         const auto flags = effect->flags;
-        if (flags & Effect::kIgnoreFromWorldFromModel) return;
+        if (flags.any(Effect::FlagBits::kIgnoreFromWorldFromModel)) return;
         if (const auto track = QsTrack(output, TrackId::kWorldFromModel); track.count) {
-            const auto value = flags & Effect::kIgnoreToWorldFromModel ? state.world :
+            const auto value = flags.any(Effect::FlagBits::kIgnoreToWorldFromModel) ? state.world :
                 XTE::Blend(state.world, TrackValue(QsTrack(to, TrackId::kWorldFromModel)), weight);
             std::memcpy(track.data, &value, sizeof(value));
         }
-        if (!(flags & Effect::kIgnoreToWorldFromModel)) {
+        if (!flags.any(Effect::FlagBits::kIgnoreToWorldFromModel)) {
             if (const auto track = QsTrack(output, TrackId::kExtractedMotion); track.count) {
                 const auto value = XTE::Blend(state.motion, TrackValue(QsTrack(to, TrackId::kExtractedMotion)), weight);
                 std::memcpy(track.data, &value, sizeof(value));
@@ -431,7 +433,7 @@ namespace
         if (!children || !children[0]) return;
 
         const auto& child = *children[0];
-        if (state.fromActive) CaptureSource(state, child, effect->timeElapsed, timeOffset);
+        if (state.fromActive) CaptureSource(state, child, effect->timeInTransition, timeOffset);
         if (child.tracks != output.tracks) output.CopyTracksFrom(child);
         if (!state.fromActive) GenerateTo(effect, context, child, output, timeOffset);
     }
