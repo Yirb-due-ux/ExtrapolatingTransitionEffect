@@ -1,4 +1,5 @@
 #include <RE/Skyrim.h>
+#include <REX/W32/KERNEL32.h>
 #include <SKSE/SKSE.h>
 #include <spdlog/sinks/basic_file_sink.h>
 
@@ -10,9 +11,12 @@
 #include <array>
 #include <atomic>
 #include <bitset>
+#include <filesystem>
 #include <fstream>
 #include <memory>
 #include <new>
+#include <string_view>
+#include <system_error>
 
 namespace logger = SKSE::log;
 
@@ -150,16 +154,41 @@ namespace
     }
 
     enum class Mode { vanilla, extrapolated, stabilized };
+    Mode configuredMode{Mode::stabilized};
 
-    Mode ReadMode() noexcept
+    Mode ParseMode(std::wstring_view value) noexcept
+    {
+        if (value == L"stabilized") return Mode::stabilized;
+        if (value == L"extrapolated") return Mode::extrapolated;
+        if (value != L"vanilla") Log<spdlog::level::warn>("XTE invalid transition mode. Using vanilla.");
+        return Mode::vanilla;
+    }
+
+    Mode LoadMode() noexcept
     {
         try {
-            std::ifstream config("Data/SKSE/Plugins/ExtrapolatingTransitionEffect.mode");
-            std::string mode;
-            config >> mode;
-            if (mode == "stabilized") return Mode::stabilized;
-            return mode == "extrapolated" ? Mode::extrapolated : Mode::vanilla;
-        } catch (const std::exception&) { return Mode::vanilla; }
+            const auto path = std::filesystem::absolute(L"Data/SKSE/Plugins/ExtrapolatingTransitionEffect/settings.ini");
+            if (!std::filesystem::exists(path)) {
+                const std::filesystem::path legacyPath{"Data/SKSE/Plugins/ExtrapolatingTransitionEffect.mode"};
+                if (!std::filesystem::exists(legacyPath)) return Mode::stabilized;
+                std::wifstream legacy(legacyPath);
+                std::wstring value;
+                if (legacy >> value) return ParseMode(value);
+            } else {
+                constexpr std::wstring_view missingMode = L"\x01";
+                std::array<wchar_t, 32> value{};
+                const auto count = REX::W32::GetPrivateProfileStringW(L"General", L"Mode", missingMode.data(),
+                    value.data(), static_cast<std::uint32_t>(value.size()), path.c_str());
+                const std::wstring_view mode{value.data(), count};
+                if (mode != missingMode) return ParseMode(mode);
+                const std::error_code error{static_cast<int>(REX::W32::GetLastError()), std::system_category()};
+                if (error == std::errc::no_such_file_or_directory) return Mode::stabilized;
+            }
+        } catch (const std::exception&) {
+            // Path and stream exceptions use the same fallback as an unsuccessful read.
+        }
+        Log<spdlog::level::warn>("XTE settings read failed. Using vanilla.");
+        return Mode::vanilla;
     }
 
     RE::hkbNode* CloneRegistered(const RE::hkbNode* source, Graph& graph) noexcept
@@ -174,7 +203,7 @@ namespace
         auto* effect = Effect::CopyConstruct(storage, source);
         effect->memSizeAndFlags = size;
         auto* state = std::construct_at(reinterpret_cast<State*>(static_cast<std::byte*>(storage) + kEffectSize));
-        state->enabled = ReadMode() != Mode::vanilla;
+        state->enabled = configuredMode != Mode::vanilla;
         SetVtable(effect, classRuntimeTable.data() + 1);
         return effect;
     }
@@ -192,7 +221,7 @@ namespace
     {
         Chained<Lifecycle>(Slot::activate)(effect, context);
         auto& state = Extension(effect);
-        const auto mode = ReadMode();
+        const auto mode = configuredMode;
         state.enabled = mode != Mode::vanilla && PlayerGraph(context) && effect->fromGenerator && effect->toGenerator;
         state.stable.reset(state.enabled && mode == Mode::stabilized ? new (std::nothrow) Stabilization : nullptr);
         if (state.enabled && mode == Mode::stabilized && !state.stable) {
@@ -500,6 +529,7 @@ SKSEPluginLoad(const SKSE::LoadInterface* skse)
         return false;
     }
     SKSE::Init(skse, false);
+    configuredMode = LoadMode();
     Log("XTE 0.3.0 Skyrim {}", skse->RuntimeVersion().string());
     const auto messaging = SKSE::GetMessagingInterface();
     return messaging && messaging->RegisterListener("SKSE", OnMessage);
