@@ -479,6 +479,7 @@ namespace
         };
         set(Slot::destroy, DestroyEffect);
         set(Slot::getClassType, XTE::RegisteredClass);
+        set(Slot::cloneNode, CloneRegistered);
         set(Slot::activate, ActivateEffect);
         set(Slot::update, UpdateEffect);
         set(Slot::deactivate, DeactivateEffect);
